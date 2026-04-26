@@ -6,16 +6,16 @@ config.json
 kaggle.json
 .kaggle/
 secrets/
+.claude/settings.local.json
 # .env.example ควร commit ไว้ (เป็น template ให้คนอื่น)
 !.env.example
 
-# ไม่เอาไฟล์รูปภาพขนาดใหญ่ในโฟลเดอร์ที่ระบุ
-data/*
+# เก็บโครงสร้างโฟลเดอร์ data/ ไว้ แต่ไม่เอาไฟล์ข้อมูลจริง
+data/**/*.csv
+data/**/*.parquet
+data/**/*.zip
+data/**/*.json
 images/*.jpg
-
-# ข้ามไฟล์ Parquet และ CSV ทุกที่ในเครื่อง
-*.parquet
-*.csv
 
 # ข้ามไฟล์ Cache ของ Python
 __pycache__/
