@@ -1,0 +1,34 @@
+# ไม่เอาโฟลเดอร์เก็บ Library
+
+# ไม่เอาไฟล์ข้อมูลความลับ หรือไฟล์ .env
+.env
+config.json
+kaggle.json
+.kaggle/
+secrets/
+# .env.example ควร commit ไว้ (เป็น template ให้คนอื่น)
+!.env.example
+
+# ไม่เอาไฟล์รูปภาพขนาดใหญ่ในโฟลเดอร์ที่ระบุ
+data/*
+images/*.jpg
+
+# ข้ามไฟล์ Parquet และ CSV ทุกที่ในเครื่อง
+*.parquet
+*.csv
+
+# ข้ามไฟล์ Cache ของ Python
+__pycache__/
+.ipynb_checkpoints/
+.venv/
+
+# ไม่เอาโมเดลที่ train แล้ว (ไฟล์ขนาดใหญ่)
+model/
+
+# ไม่เอา notebook checkpoints และ assets รูปภาพขนาดใหญ่
+notebooks/**/.ipynb_checkpoints/
+notebooks/**/assets/**/*.png
+notebooks/**/assets/**/*.jpg
+# pixi environments
+.pixi/*
+!.pixi/config.toml

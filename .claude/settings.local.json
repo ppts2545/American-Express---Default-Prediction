@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(conda env *)",
+      "Read(//home/ppt/**)",
+      "Read(//opt/**)",
+      "Read(//home/ppt/.local/share/**)",
+      "Bash(pyenv versions *)",
+      "Bash(mamba env *)",
+      "Bash(xargs sed *)",
+      "Bash(/home/ppt/.pixi/bin/pixi install *)",
+      "Bash(/home/ppt/.pixi/bin/pixi run python -c ' *)",
+      "Bash(/home/ppt/.pixi/bin/pixi run *)"
+    ]
+  }
+}
