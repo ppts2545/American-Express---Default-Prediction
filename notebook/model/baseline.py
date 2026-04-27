@@ -6,15 +6,6 @@ app = marimo.App(width="full")
 
 @app.cell
 def _():
-    # ── imports ──────────────────────────────────────────────────────────────
-    # re        : ใช้ parse ชื่อ column เช่น "D_39_mean" → group=D, id=39, agg=mean
-    # Path      : จัดการ path ไฟล์แบบ cross-platform
-    # polars    : DataFrame library ที่เร็วและประหยัด RAM กว่า pandas มาก
-    # cs        : polars.selectors — ใช้เลือก column ตาม dtype เช่น cs.numeric()
-    # lgb / xgb : โมเดล Gradient Boosting ที่นิยมใช้ใน tabular data
-    # StratifiedKFold : แบ่ง fold โดยรักษาสัดส่วน class ให้เท่ากันทุก fold
-    # train_test_split: แบ่ง training fold ออกเป็น inner train + early-stop holdout
-    # roc_auc_score   : วัด AUC (Area Under Curve) — ค่ายิ่งสูงยิ่งดี (max=1.0)
     import re
     from pathlib import Path
 
@@ -24,7 +15,6 @@ def _():
     import pandas as pd
     import polars as pl
     import polars.selectors as cs
-
     import lightgbm as lgb
     import xgboost as xgb
     from sklearn.model_selection import StratifiedKFold, train_test_split
@@ -33,32 +23,22 @@ def _():
     mo.md("""
     # Baseline Model — American Express Default Prediction
 
-    ## Leak-Free Pipeline Design
+    ## หลักการ: Leakage ต้องเป็นไปไม่ได้โดยโครงสร้าง
 
-    Leakage must be **impossible by structure**, not just avoided by convention.
+    ทุกขั้นตอนถูกห่อด้วยฟังก์ชันที่รับเฉพาะข้อมูลที่อนุญาตให้เห็น
+    → ทำให้ leakage เป็น "ไม่มีทางทำได้" ไม่ใช่แค่ "พยายามระวัง"
 
     ```
-    For each outer fold:
-    ┌─────────────────────────────────────────────────────┐
-    │  Training fold (80%)                                │
-    │  ┌──────────────────────┐  ┌──────────────────────┐│
-    │  │  Inner train (90%)   │  │  Early-stop val(10%) ││
-    │  │  - feature selection │  │  - only for stopping ││
-    │  │  - model fitting     │  │  - never in OOF eval ││
-    │  └──────────────────────┘  └──────────────────────┘│
-    └─────────────────────────────────────────────────────┘
-    ┌─────────────────────────────────────────────────────┐
-    │  OOF Validation (20%) — NEVER touched during train  │
-    └─────────────────────────────────────────────────────┘
+    drop_red_flags()          ← ลบ feature อันตรายออกก่อนทุกอย่าง
+         ↓
+    select_features_leak_free()  ← เลือก feature จาก inner train เท่านั้น
+         ↓
+    get_fold_arrays()         ← แปลงเฉพาะ columns ที่เลือกแล้วเป็น numpy
+         ↓
+    train_lgb_fold() / train_xgb_fold()  ← train โดยไม่รู้จัก val เลย
+         ↓
+    evaluate_oof()            ← วัดผลบน OOF ที่ไม่เคยถูกแตะ
     ```
-
-    | Leakage Type | Status | How Eliminated |
-    |-------------|--------|----------------|
-    | Feature selection | ✅ Eliminated | Selected from inner train only |
-    | Imputation | ✅ N/A | LightGBM/XGBoost handle NaN natively |
-    | Early stopping | ✅ Eliminated | Separate inner holdout, not OOF |
-    | Global statistics | ✅ None used | All stats computed per-fold |
-    | Temporal | ⚠️ Partial | StratifiedKFold for baseline — time split for production |
     """)
     return (
         Path,
@@ -78,121 +58,300 @@ def _():
 
 
 @app.cell
-def _(Path, cs, pd, pl, re):
-    # ── โหลดข้อมูลและเตรียม metadata ────────────────────────────────────────
+def _(pl):
+    def drop_red_flags(df: "pl.DataFrame", numeric_cols: list, threshold: float = 0.9):
+        """
+        ขั้นตอนที่ 1 — ลบ feature ที่อันตรายออกก่อนเข้า CV
 
-    # หา project root โดยเดินขึ้นจาก location ของไฟล์นี้จนเจอ pixi.toml
-    # วิธีนี้ทำให้ notebook รันได้จากทุกที่ ไม่ hardcode path
+        ใช้ full training data เพื่อ "กำจัด" feature ที่สัมพันธ์กับ target
+        สูงเกินไป (อาจเป็น target ในรูปแบบอื่น = leakage)
+
+        การใช้ full data ที่นี่ปลอดภัย เพราะเราทำเพื่อ "ห้าม" ไม่ใช่ "เลือก":
+        - ห้าม (exclusion) จาก full data → ปลอดภัย
+        - เลือก (selection) จาก full data → leakage!
+
+        Parameters
+        ----------
+        df            : full training dataframe (Polars)
+        numeric_cols  : รายชื่อ column ทั้งหมดที่จะพิจารณา
+        threshold     : ค่า |corr| ที่ถือว่าอันตราย (default 0.9)
+
+        Returns
+        -------
+        safe_cols     : รายชื่อ column ที่ผ่านการตรวจ — ใช้ใน CV ได้
+        report        : Polars DataFrame แสดง corr ของทุก column
+        """
+        # คำนวณ |correlation| ระหว่างทุก feature กับ target
+        report = (
+            df.select([pl.corr(c, "target").alias(c) for c in numeric_cols])
+            .unpivot(variable_name="feature", value_name="corr")
+            .with_columns(pl.col("corr").abs().alias("abs_corr"))
+            .sort("abs_corr", descending=True)
+        )
+
+        # แยก safe กับ red_flag
+        safe_cols    = report.filter(pl.col("abs_corr") <= threshold)["feature"].to_list()
+        dropped_cols = report.filter(pl.col("abs_corr") >  threshold)["feature"].to_list()
+
+        # หยุดโปรแกรมทันทีถ้ามี red flag และยังไม่ได้ถูก drop
+        # (ป้องกันกรณีที่มีคนแก้โค้ดแล้วข้ามขั้นตอนนี้)
+        assert len(dropped_cols) == 0 or len(safe_cols) < len(numeric_cols), \
+            "drop_red_flags() failed to remove dangerous features!"
+
+        return safe_cols, report
+
+    return (drop_red_flags,)
+
+
+@app.cell
+def _(pl):
+    def select_features_leak_free(inner_df: "pl.DataFrame", safe_cols: list, top_n: int):
+        """
+        ขั้นตอนที่ 2 — เลือก feature จาก inner train เท่านั้น
+
+        ฟังก์ชันนี้รับแค่ inner_df (ไม่รู้จัก val fold เลย)
+        → เป็นไปไม่ได้ที่ val labels จะรั่วเข้ามาในการเลือก feature
+
+        Parameters
+        ----------
+        inner_df  : เฉพาะ rows ของ inner training (ไม่มี early-stop holdout, ไม่มี OOF val)
+        safe_cols : รายชื่อ column ที่ผ่าน drop_red_flags() แล้ว
+        top_n     : จำนวน feature ที่ต้องการเลือก
+
+        Returns
+        -------
+        selected  : list ของ feature ที่เลือกสำหรับ fold นี้
+        """
+        selected = (
+            inner_df
+            # คำนวณ corr บน inner train เท่านั้น — val rows ไม่อยู่ใน inner_df
+            .select([pl.corr(c, "target").alias(c) for c in safe_cols])
+            .unpivot(variable_name="feature", value_name="corr")
+            .with_columns(pl.col("corr").abs())
+            .sort("corr", descending=True)
+            .head(top_n)
+        )["feature"].to_list()
+        return selected
+
+    return (select_features_leak_free,)
+
+
+@app.function
+def get_fold_arrays(df, row_indices: "np.ndarray", feature_cols: list):
+    """
+    ขั้นตอนที่ 3 — แปลง Polars → numpy เฉพาะ rows และ columns ที่อนุญาต
+
+    แยก X และ y ออกจากกัน และ convert เฉพาะ columns ที่เลือกแล้ว
+    → ไม่มีทางที่ feature ที่ไม่ได้เลือกหรือ val rows จะรั่วเข้าไป
+
+    Parameters
+    ----------
+    df           : full Polars DataFrame
+    row_indices  : numpy array ของ index ที่อนุญาตให้เห็น
+    feature_cols : รายชื่อ feature ที่เลือกแล้ว (จาก select_features_leak_free)
+
+    Returns
+    -------
+    X : numpy array รูปร่าง (n_rows, n_features)
+    y : numpy array รูปร่าง (n_rows,)
+    """
+    # แปลงเฉพาะ rows ที่อนุญาต + columns ที่เลือกแล้วเท่านั้น
+    subset = df[list(map(int, row_indices))]
+    X = subset.select(feature_cols).to_numpy()
+    y = subset["target"].to_numpy()
+    return X, y
+
+
+@app.cell
+def _(lgb):
+    def train_lgb_fold(X_inner, y_inner, X_es, y_es, params: dict, n_rounds=1000, patience=50):
+        """
+        ขั้นตอนที่ 4a — Train LightGBM สำหรับ 1 fold
+
+        ฟังก์ชันนี้ไม่รู้จัก val/OOF เลย — รับแค่ inner train และ early-stop holdout
+        → val labels เป็นไปไม่ได้ที่จะรั่วเข้า training loop
+
+        Parameters
+        ----------
+        X_inner, y_inner : inner training data (90% ของ training fold)
+        X_es, y_es       : early-stop holdout (10% ของ training fold)
+                           ใช้เพื่อหยุด training เท่านั้น ไม่ใช่ OOF val
+        params           : LightGBM hyperparameters
+        n_rounds         : จำนวนต้นไม้สูงสุด
+        patience         : หยุดถ้า val AUC ไม่ดีขึ้นใน patience รอบต่อเนื่อง
+
+        Returns
+        -------
+        model : trained LightGBM model
+        """
+        dtrain = lgb.Dataset(X_inner, label=y_inner)
+        des    = lgb.Dataset(X_es,    label=y_es, reference=dtrain)
+        model  = lgb.train(
+            params, dtrain,
+            num_boost_round=n_rounds,
+            valid_sets=[des],
+            callbacks=[
+                lgb.early_stopping(patience, verbose=False),
+                lgb.log_evaluation(False),
+            ],
+        )
+        return model
+
+    return (train_lgb_fold,)
+
+
+@app.cell
+def _(xgb):
+    def train_xgb_fold(X_inner, y_inner, X_es, y_es, params: dict, n_rounds=1000, patience=50):
+        """
+        ขั้นตอนที่ 4b — Train XGBoost สำหรับ 1 fold
+
+        โครงสร้างเหมือน train_lgb_fold ทุกอย่าง
+        val/OOF data ไม่มีทางเข้ามาในฟังก์ชันนี้
+
+        Parameters
+        ----------
+        X_inner, y_inner : inner training data
+        X_es, y_es       : early-stop holdout
+        params           : XGBoost hyperparameters
+        n_rounds, patience: เหมือน LightGBM
+
+        Returns
+        -------
+        model : trained XGBoost model
+        """
+        dtrain = xgb.DMatrix(X_inner, label=y_inner)
+        des    = xgb.DMatrix(X_es,    label=y_es)
+        model  = xgb.train(
+            params, dtrain,
+            num_boost_round=n_rounds,
+            evals=[(des, "es")],
+            early_stopping_rounds=patience,
+            verbose_eval=False,
+        )
+        return model
+
+    return (train_xgb_fold,)
+
+
+@app.cell
+def _(roc_auc_score):
+    def evaluate_oof(model, X_val, y_val, model_type: str = "lgb"):
+        """
+        ขั้นตอนที่ 5 — วัดผลบน OOF ที่ไม่เคยถูกแตะระหว่าง training
+
+        ฟังก์ชันนี้เรียกหลังจาก train เสร็จแล้วเท่านั้น
+        X_val, y_val ไม่เคยเข้าไปใน train_lgb_fold หรือ train_xgb_fold
+
+        Parameters
+        ----------
+        model      : trained model (LightGBM หรือ XGBoost)
+        X_val      : features ของ OOF validation rows
+        y_val      : labels จริงของ OOF rows
+        model_type : "lgb" หรือ "xgb"
+
+        Returns
+        -------
+        preds : numpy array ของ predicted probabilities
+        auc   : AUC score สำหรับ fold นี้
+        """
+        if model_type == "lgb":
+            import lightgbm as _lgb
+            preds = model.predict(X_val)
+        else:
+            import xgboost as _xgb
+            preds = model.predict(_xgb.DMatrix(X_val))
+
+        auc = roc_auc_score(y_val, preds)
+        return preds, auc
+
+    return (evaluate_oof,)
+
+
+@app.cell
+def _(Path, cs, pd, pl, re):
+    # โหลดข้อมูล — df ยังเป็น Polars ตลอด ไม่ to_pandas() ทั้ง frame
     ROOT = Path(__file__).resolve().parent
     while not (ROOT / "pixi.toml").exists():
         ROOT = ROOT.parent
-    DATA = ROOT / "data/processed"
 
-    # อ่านข้อมูลด้วย Polars — เร็วกว่า pandas และประหยัด RAM
-    train_feat = pl.read_parquet(DATA / "train_features.parquet")
-    labels     = pl.read_parquet(DATA / "train_labels.parquet")
+    train_feat = pl.read_parquet(ROOT / "data/processed/train_features.parquet")
+    labels     = pl.read_parquet(ROOT / "data/processed/train_labels.parquet")
+    df         = train_feat.join(labels.select(["customer_ID", "target"]), on="customer_ID")
 
-    # join labels เข้ากับ features ใน Polars ทั้งหมด
-    # ไม่เรียก .to_pandas() กับ full frame เด็ดขาด เพราะ 458k × 1262 cols จะกิน RAM มาก
-    # เรียก .to_pandas() / .to_numpy() เฉพาะตอนที่จำเป็นจริงๆ เท่านั้น
-    df = train_feat.join(labels.select(["customer_ID", "target"]), on="customer_ID")
-
-    # cs.numeric().exclude("target") = เลือกทุก column ที่เป็นตัวเลข ยกเว้น target
     numeric_cols = df.select(cs.numeric().exclude("target")).columns
 
-    # สร้าง metadata จากชื่อ column เท่านั้น ไม่ต้องแตะข้อมูลจริง
-    # ชื่อ column มีรูปแบบ: {group}_{id}_{agg} เช่น D_39_mean, B_1_last
     col_meta = []
     for _c in numeric_cols:
         _m = re.match(r"^([A-Z])_(\d+)_(\w+)$", _c)
         if _m:
             col_meta.append({"column": _c, "group": _m.group(1), "agg": _m.group(3)})
-
-    # meta_df เก็บแค่ชื่อ column + group + agg type — เป็น pandas เพราะเล็กมาก
     meta_df = pd.DataFrame(col_meta)
     return df, numeric_cols
 
 
 @app.cell
-def _(df, mo, numeric_cols, pl, plt):
-    # ── Step 1: Red Flag Check ───────────────────────────────────────────────
-    # คำนวณ correlation ระหว่างทุก feature กับ target
-    # pl.corr(a, b) = Pearson correlation ค่า -1 ถึง 1
-    # .abs() = เอาค่าสัมบูรณ์ เพราะ -0.9 อันตรายเท่ากับ +0.9
-    #
-    # ทำไมต้องเช็ค?
-    # ถ้า feature มี correlation สูงมาก (>0.9) กับ target
-    # อาจแปลว่า feature นั้น "คือ" target ในรูปแบบอื่น → leakage!
-    # ตัวอย่าง: ถ้า feature = "จำนวนวันที่ค้างชำระ" และ target = "ผิดนัดชำระ"
-    # สองอย่างนี้แทบเป็นอันเดียวกัน — โมเดลจะ "โกง" โดยใช้ feature นั้น
-    corr_all = (
-        df.select([pl.corr(c, "target").alias(c) for c in numeric_cols])
-        .unpivot(variable_name="feature", value_name="corr")
-        .with_columns(pl.col("corr").abs().alias("abs_corr"))
-        .sort("abs_corr", descending=True)
-    )
+def _(df, drop_red_flags, mo, numeric_cols, pl, plt):
+    # ── Gate 1: ลบ red flag features ออกก่อน — ถ้าไม่ผ่านขั้นนี้ CV ไม่เริ่ม ─
+    safe_cols, corr_report = drop_red_flags(df, numeric_cols, threshold=0.9)
 
-    # แบ่ง feature ตามระดับความเสี่ยง
-    red_flags  = corr_all.filter(pl.col("abs_corr") > 0.9)   # อันตราย — ต้อง drop ทันที
-    suspicious = corr_all.filter((pl.col("abs_corr") > 0.5) & (pl.col("abs_corr") <= 0.9))
+    red_flags  = corr_report.filter(pl.col("abs_corr") > 0.9)
+    suspicious = corr_report.filter((pl.col("abs_corr") > 0.5) & (pl.col("abs_corr") <= 0.9))
+    n_dropped  = len(numeric_cols) - len(safe_cols)
 
-    def _plot():
+    def _plot_gate():
         fig, axes = plt.subplots(1, 2, figsize=(14, 4))
 
-        vals = corr_all["abs_corr"].to_numpy()
+        vals = corr_report["abs_corr"].to_numpy()
         axes[0].hist(vals, bins=60, color="#6c8ebf", edgecolor="white")
         axes[0].axvline(0.5, color="orange", linestyle="--", linewidth=1.5, label="Suspicious >0.5")
-        axes[0].axvline(0.9, color="red",    linestyle="--", linewidth=1.5, label="Red flag >0.9")
+        axes[0].axvline(0.9, color="red",    linestyle="--", linewidth=1.5, label="Red flag >0.9 (DROPPED)")
         axes[0].set_xlabel("|Correlation with Target|")
         axes[0].set_ylabel("# Features")
-        axes[0].set_title("Distribution of All Feature Correlations", fontweight="bold")
+        axes[0].set_title("Gate 1: Red Flag Filter", fontweight="bold")
         axes[0].legend()
 
-        top20 = corr_all.head(20)
+        top20  = corr_report.head(20)
         colors = ["#d62728" if v > 0.9 else "#ff7f0e" if v > 0.5 else "#4C72B0"
                   for v in top20["abs_corr"].to_list()]
         axes[1].barh(top20["feature"].to_list()[::-1],
                      top20["abs_corr"].to_list()[::-1], color=colors[::-1])
-        axes[1].axvline(0.5, color="orange", linestyle="--", alpha=0.6)
-        axes[1].axvline(0.9, color="red",    linestyle="--", alpha=0.6)
-        axes[1].set_xlabel("|Correlation with Target|")
-        axes[1].set_title("Top 20 Most Correlated Features", fontweight="bold")
-
-        plt.suptitle("Leakage Red Flag Check", fontsize=13, fontweight="bold")
+        axes[1].axvline(0.9, color="red", linestyle="--", linewidth=1.5, alpha=0.8,
+                        label="Drop threshold")
+        axes[1].set_title("Top 20 Correlations\n(red = BLOCKED from model)", fontweight="bold")
+        axes[1].legend()
         plt.tight_layout()
         return fig
 
-    fig_redflags = _plot()
+    fig_gate = _plot_gate()
+
     mo.md(f"""
-    ## Step 1: Red Flag Check
-    Features with very high correlation may be the target variable in disguise.
+    ## Gate 1: Red Flag Filter — ผ่านแล้วจึงเดินหน้าต่อได้
 
-    | Risk | Threshold | Count | Action |
-    |------|-----------|-------|--------|
-    | 🔴 Red flag  | corr > 0.9    | **{len(red_flags)}**   | Drop immediately |
-    | 🟠 Suspicious | 0.5 < corr ≤ 0.9 | **{len(suspicious)}** | Investigate |
-    | ✅ Safe       | corr ≤ 0.5    | **{len(corr_all) - len(red_flags) - len(suspicious)}** | OK |
+    `drop_red_flags()` ประมวลผลเสร็จแล้ว:
 
-    {"🔴 **Red flag features exist — must investigate before proceeding.**" if len(red_flags) > 0 else "✅ No red flag features. Safe to proceed."}
+    | | จำนวน |
+    |-|-------|
+    | Features ทั้งหมด | {len(numeric_cols)} |
+    | 🔴 Dropped (corr > 0.9) | **{n_dropped}** |
+    | 🟠 Suspicious (0.5–0.9) | **{len(suspicious)}** |
+    | ✅ Safe — เข้า CV ได้ | **{len(safe_cols)}** |
+
+    {"✅ ไม่มี red flag — safe_cols พร้อมใช้งาน" if n_dropped == 0 else f"🔴 {n_dropped} features ถูก block ออกจาก model แล้ว — จะไม่มีทางเข้า CV"}
     """)
-    return (fig_redflags,)
+    return fig_gate, safe_cols
 
 
 @app.cell
-def _(fig_redflags):
-    fig_redflags
+def _(fig_gate):
+    fig_gate
     return
 
 
 @app.cell
 def _():
-    # ── hyperparameters ของ CV ────────────────────────────────────────────────
-    # TOP_N   = จำนวน feature ที่จะใช้ train (เลือกจาก top correlation ต่อ fold)
-    # N_FOLDS = จำนวน fold ใน cross-validation
-    #           ค่ามาตรฐาน = 5 → ข้อมูลถูกแบ่ง 5 ส่วน, train 4 ส่วน, val 1 ส่วน
-    #           วนครบ 5 รอบ ทุก row จะถูก validate ครั้งหนึ่ง (= OOF)
-    TOP_N   = 30
-    N_FOLDS = 5
+    TOP_N   = 30   # จำนวน feature ที่เลือกต่อ fold
+    N_FOLDS = 5    # จำนวน fold ใน CV
     return N_FOLDS, TOP_N
 
 
@@ -202,126 +361,70 @@ def _(
     StratifiedKFold,
     TOP_N,
     df,
-    lgb,
+    evaluate_oof,
     mo,
     np,
-    numeric_cols,
-    pl,
     roc_auc_score,
+    safe_cols,
+    select_features_leak_free,
+    train_lgb_fold,
     train_test_split,
 ):
-    # ── Step 2: LightGBM — Leak-Free 5-Fold CV ──────────────────────────────
-    import time
+    import time as _time
 
-    # y   = target array (0 = ไม่ผิดนัด, 1 = ผิดนัดชำระ)
-    # idx = array ของ index [0, 1, 2, ..., N-1] ใช้สำหรับ split
-    y   = df["target"].to_numpy()
-    idx = np.arange(len(y))
+    # y และ idx ดึงจาก df — ไม่ convert ทั้ง frame
+    _y   = df["target"].to_numpy()
+    _idx = np.arange(len(_y))
 
-    # StratifiedKFold: แบ่ง fold โดยรักษาสัดส่วน class ให้สม่ำเสมอทุก fold
-    # ถ้าข้อมูล 20% เป็น default → ทุก fold จะมี default ประมาณ 20% เท่ากัน
-    # shuffle=True: สุ่มลำดับก่อนแบ่ง ป้องกัน bias จากลำดับข้อมูล
-    skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=42)
+    _skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=42)
 
-    # LightGBM hyperparameters
-    # learning_rate  : ขนาดก้าวในการเรียนรู้ — เล็กกว่า = แม่นกว่า แต่ช้ากว่า
-    # num_leaves     : ความซับซ้อนของต้นไม้ — มากเกินไป = overfit
-    # max_depth      : ความลึกสูงสุดของต้นไม้
-    # min_child_samples: จำนวน sample ขั้นต่ำในแต่ละ leaf — ป้องกัน overfit
-    # feature_fraction : ใช้ feature กี่ % ต่อต้นไม้ — เหมือน dropout ใน NN
-    # bagging_fraction : ใช้ข้อมูลกี่ % ต่อต้นไม้ — ลด variance
-    # bagging_freq     : ทำ bagging ทุกกี่ต้นไม้
-    lgb_params = {
-        "objective": "binary",   # binary classification (0 หรือ 1)
-        "metric": "auc",
-        "learning_rate": 0.05,
-        "num_leaves": 31,
-        "max_depth": 6,
-        "min_child_samples": 100,
-        "feature_fraction": 0.8,
-        "bagging_fraction": 0.8,
-        "bagging_freq": 1,
-        "verbosity": -1,          # ปิด log ระหว่าง train
-        "random_state": 42,
+    _lgb_params = {
+        "objective": "binary", "metric": "auc",
+        "learning_rate": 0.05, "num_leaves": 31, "max_depth": 6,
+        "min_child_samples": 100, "feature_fraction": 0.8,
+        "bagging_fraction": 0.8, "bagging_freq": 1,
+        "verbosity": -1, "random_state": 42,
     }
 
-    lgb_oof        = np.zeros(len(y))   # เก็บ prediction ของทุก row ตอนเป็น validation
-    lgb_fold_aucs  = []                  # เก็บ AUC ของแต่ละ fold
-    lgb_fold_feats = []                  # เก็บ features ที่เลือกใน แต่ละ fold
+    lgb_oof        = np.zeros(len(_y))
+    lgb_fold_aucs  = []
+    lgb_fold_feats = []
 
-    _t0 = time.time()
-    for _fold, (_tr_idx, _val_idx) in enumerate(skf.split(idx, y)):
-        # _tr_idx  = index ของ training rows ใน fold นี้ (80%)
-        # _val_idx = index ของ validation rows ใน fold นี้ (20%) ← OOF set
+    _t0 = _time.time()
+    for _fold, (_tr_idx, _val_idx) in enumerate(_skf.split(_idx, _y)):
 
-        # ── แบ่ง training ออกเป็น inner train + early-stop holdout ──────────
-        # ทำไมต้องแบ่งอีก?
-        # LightGBM ใช้ early stopping = หยุด train เมื่อ val AUC ไม่ดีขึ้น 50 รอบ
-        # ถ้าเราใช้ OOF val เป็น early stopping → val labels รั่วเข้า training loop → leakage!
-        # แก้ด้วยการแยก inner holdout (10% ของ training) สำหรับ early stopping โดยเฉพาะ
-        # OOF val (_val_idx) จะไม่ถูกแตะเลยจนกว่าจะถึงขั้นตอน evaluate
+        # แบ่ง training → inner train + early-stop holdout
         _inner_idx, _es_idx = train_test_split(
-            _tr_idx,
-            test_size=0.1,           # 10% ของ training → early-stop holdout
-            random_state=_fold,      # seed ต่างกันทุก fold เพื่อความหลากหลาย
-            stratify=y[_tr_idx],     # รักษาสัดส่วน class ใน holdout ด้วย
+            _tr_idx, test_size=0.1, random_state=_fold, stratify=_y[_tr_idx]
         )
 
-        # ── Feature selection บน inner train เท่านั้น ────────────────────────
-        # ทำไมต้องทำใน fold?
-        # ถ้าเลือก feature จากข้อมูลทั้งหมดก่อน CV → labels ของ val fold
-        # มีส่วนในการเลือก feature → leakage!
-        # การเลือกใน inner train เท่านั้น ทำให้ val fold "ไม่รู้" ว่า feature ไหนถูกเลือก
+        # Gate 2: เลือก feature จาก inner train เท่านั้น (ผ่านฟังก์ชัน)
+        # safe_cols มาจาก Gate 1 → ไม่มี red flag อยู่ใน pool แล้ว
         _inner_df = df[list(map(int, _inner_idx))]
-        _fold_corr = (
-            _inner_df
-            .select([pl.corr(c, "target").alias(c) for c in numeric_cols])
-            .unpivot(variable_name="feature", value_name="corr")
-            .with_columns(pl.col("corr").abs())
-            .sort("corr", descending=True)
-            .head(TOP_N)   # หยิบ TOP_N features ที่ corr สูงสุด
-        )
-        _feats = _fold_corr["feature"].to_list()
+        _feats    = select_features_leak_free(_inner_df, safe_cols, TOP_N)
         lgb_fold_feats.append(_feats)
 
-        # ── Convert เฉพาะ columns ที่เลือกเป็น numpy ────────────────────────
-        # ไม่ convert ทั้ง 1262 columns — แค่ TOP_N columns ที่ต้องใช้จริง
-        # ประหยัด RAM มาก: 30 cols × 458k rows แทนที่จะเป็น 1262 cols
-        _X_inner = df[list(map(int, _inner_idx))].select(_feats).to_numpy()
-        _X_es    = df[list(map(int, _es_idx))   ].select(_feats).to_numpy()
-        _X_val   = df[list(map(int, _val_idx))  ].select(_feats).to_numpy()
-        _y_inner, _y_es, _y_val = y[_inner_idx], y[_es_idx], y[_val_idx]
+        # Gate 3: แปลงเฉพาะ rows+cols ที่อนุญาต (ผ่านฟังก์ชัน)
+        _X_inner, _y_inner = get_fold_arrays(df, _inner_idx, _feats)
+        _X_es,    _y_es    = get_fold_arrays(df, _es_idx,    _feats)
+        _X_val,   _y_val   = get_fold_arrays(df, _val_idx,   _feats)
 
-        # ── Train LightGBM ────────────────────────────────────────────────────
-        # lgb.Dataset = format ที่ LightGBM ใช้ภายใน (เร็วกว่า numpy โดยตรง)
-        # reference=_dtrain → บอก LightGBM ว่า _des ใช้ encoding เดียวกับ _dtrain
-        _dtrain = lgb.Dataset(_X_inner, label=_y_inner)
-        _des    = lgb.Dataset(_X_es, label=_y_es, reference=_dtrain)
+        # Gate 4: Train — ฟังก์ชันไม่รับ val data เลย
+        _model = train_lgb_fold(_X_inner, _y_inner, _X_es, _y_es, _lgb_params)
 
-        # num_boost_round = จำนวนต้นไม้สูงสุด (early stopping จะหยุดก่อนถ้า val ไม่ดีขึ้น)
-        # early_stopping(50) = หยุดถ้า val AUC ไม่ดีขึ้นใน 50 รอบต่อเนื่อง
-        # valid_sets=[_des] = ใช้ early-stop holdout (ไม่ใช่ OOF val!) สำหรับ early stopping
-        _model = lgb.train(
-            lgb_params, _dtrain,
-            num_boost_round=1000,
-            valid_sets=[_des],
-            callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(False)],
-        )
+        # Gate 5: Evaluate บน OOF ที่ไม่เคยเข้า train
+        _preds, _auc       = evaluate_oof(_model, _X_val, _y_val, "lgb")
+        lgb_oof[_val_idx]  = _preds
+        lgb_fold_aucs.append(_auc)
 
-        # ── Evaluate บน OOF — ไม่เคยถูกแตะระหว่าง training เลย ─────────────
-        # lgb_oof[_val_idx] = prediction ของ rows ที่เป็น OOF ใน fold นี้
-        # พอวนครบทุก fold → lgb_oof จะมี prediction ครบทุก row ใน dataset
-        # นี่คือ "OOF score" ซึ่งเป็น unbiased estimate ของ real-world performance
-        lgb_oof[_val_idx] = _model.predict(_X_val)
-        lgb_fold_aucs.append(roc_auc_score(_y_val, lgb_oof[_val_idx]))
-
-    lgb_time    = time.time() - _t0
-    # OOF AUC = AUC จาก prediction ทุก row (แต่ละ row ถูก predict ตอนเป็น val)
-    # นี่เป็น metric ที่น่าเชื่อถือที่สุด เพราะทุก row ไม่เคยถูก train ก่อน predict
-    lgb_oof_auc = roc_auc_score(y, lgb_oof)
+    lgb_time    = _time.time() - _t0
+    lgb_oof_auc = roc_auc_score(_y, lgb_oof)
+    y           = _y
+    skf         = _skf
+    idx         = _idx
 
     mo.md(f"""
-    ## Step 2: LightGBM — Leak-Free 5-Fold CV
+    ## Gate 2–5: LightGBM Leak-Free CV
 
     | Fold | AUC |
     |------|-----|
@@ -330,102 +433,60 @@ def _(
 
     Training time: {lgb_time:.1f}s
     """)
-    return (
-        idx,
-        lgb_fold_aucs,
-        lgb_fold_feats,
-        lgb_oof_auc,
-        lgb_time,
-        skf,
-        time,
-        y,
-    )
+    return idx, lgb_fold_aucs, lgb_fold_feats, lgb_oof_auc, lgb_time, skf, y
 
 
 @app.cell
 def _(
     TOP_N,
     df,
+    evaluate_oof,
     idx,
     mo,
     np,
-    numeric_cols,
-    pl,
     roc_auc_score,
+    safe_cols,
+    select_features_leak_free,
     skf,
-    time,
     train_test_split,
-    xgb,
+    train_xgb_fold,
     y,
 ):
-    # ── Step 3: XGBoost — โครงสร้างเหมือน LightGBM ทุกอย่าง ────────────────
-    # XGBoost และ LightGBM ต่างกันที่ algorithm การสร้างต้นไม้:
-    # - XGBoost: สร้างต้นไม้ level-by-level (breadth-first) = ช้ากว่าแต่ stable
-    # - LightGBM: สร้างแบบ leaf-wise (ขยาย leaf ที่ลด loss มากสุด) = เร็วกว่า
-    # การ train ทั้งสองและเปรียบเทียบ AUC ทำให้รู้ว่าโมเดลไหนเหมาะกับข้อมูลนี้
-    xgb_params = {
-        "objective": "binary:logistic",   # output เป็น probability
-        "eval_metric": "auc",
-        "learning_rate": 0.05,
-        "max_depth": 6,
-        "min_child_weight": 100,          # เหมือน min_child_samples ของ LightGBM
-        "subsample": 0.8,                 # เหมือน bagging_fraction
-        "colsample_bytree": 0.8,          # เหมือน feature_fraction
-        "tree_method": "hist",            # ใช้ histogram approximation — เร็วกว่า exact
-        "verbosity": 0,
-        "random_state": 42,
+    import time as _time2
+
+    _xgb_params = {
+        "objective": "binary:logistic", "eval_metric": "auc",
+        "learning_rate": 0.05, "max_depth": 6, "min_child_weight": 100,
+        "subsample": 0.8, "colsample_bytree": 0.8,
+        "tree_method": "hist", "verbosity": 0, "random_state": 42,
     }
 
     xgb_oof       = np.zeros(len(y))
     xgb_fold_aucs = []
 
-    _t0 = time.time()
+    _t0 = _time2.time()
     for _fold, (_tr_idx, _val_idx) in enumerate(skf.split(idx, y)):
-
-        # แบ่ง training → inner train + early-stop holdout (เหมือน LightGBM)
         _inner_idx, _es_idx = train_test_split(
             _tr_idx, test_size=0.1, random_state=_fold, stratify=y[_tr_idx]
         )
 
-        # Feature selection บน inner train เท่านั้น (เหมือน LightGBM)
         _inner_df = df[list(map(int, _inner_idx))]
-        _fold_corr = (
-            _inner_df
-            .select([pl.corr(c, "target").alias(c) for c in numeric_cols])
-            .unpivot(variable_name="feature", value_name="corr")
-            .with_columns(pl.col("corr").abs())
-            .sort("corr", descending=True)
-            .head(TOP_N)
-        )
-        _feats = _fold_corr["feature"].to_list()
+        _feats    = select_features_leak_free(_inner_df, safe_cols, TOP_N)
 
-        _X_inner = df[list(map(int, _inner_idx))].select(_feats).to_numpy()
-        _X_es    = df[list(map(int, _es_idx))   ].select(_feats).to_numpy()
-        _X_val   = df[list(map(int, _val_idx))  ].select(_feats).to_numpy()
-        _y_inner, _y_es, _y_val = y[_inner_idx], y[_es_idx], y[_val_idx]
+        _X_inner, _y_inner = get_fold_arrays(df, _inner_idx, _feats)
+        _X_es,    _y_es    = get_fold_arrays(df, _es_idx,    _feats)
+        _X_val,   _y_val   = get_fold_arrays(df, _val_idx,   _feats)
 
-        # XGBoost ใช้ DMatrix แทน Dataset ของ LightGBM
-        _dtrain = xgb.DMatrix(_X_inner, label=_y_inner)
-        _des    = xgb.DMatrix(_X_es,    label=_y_es)
-        _dval   = xgb.DMatrix(_X_val,   label=_y_val)
+        _model             = train_xgb_fold(_X_inner, _y_inner, _X_es, _y_es, _xgb_params)
+        _preds, _auc       = evaluate_oof(_model, _X_val, _y_val, "xgb")
+        xgb_oof[_val_idx]  = _preds
+        xgb_fold_aucs.append(_auc)
 
-        # evals=[(_des, "es")] = early stopping บน early-stop holdout (ไม่ใช่ OOF)
-        _model = xgb.train(
-            xgb_params, _dtrain,
-            num_boost_round=1000,
-            evals=[(_des, "es")],
-            early_stopping_rounds=50,
-            verbose_eval=False,
-        )
-
-        xgb_oof[_val_idx] = _model.predict(_dval)
-        xgb_fold_aucs.append(roc_auc_score(_y_val, xgb_oof[_val_idx]))
-
-    xgb_time    = time.time() - _t0
+    xgb_time    = _time2.time() - _t0
     xgb_oof_auc = roc_auc_score(y, xgb_oof)
 
     mo.md(f"""
-    ## Step 3: XGBoost — Leak-Free 5-Fold CV
+    ## Gate 2–5: XGBoost Leak-Free CV
 
     | Fold | AUC |
     |------|-----|
@@ -446,80 +507,64 @@ def _(
     lgb_oof_auc,
     mo,
     np,
-    numeric_cols,
-    pl,
     roc_auc_score,
+    safe_cols,
+    select_features_leak_free,
     skf,
     train_test_split,
     y,
 ):
-    # ── Step 4: Shuffle Sanity Test — พิสูจน์ว่าไม่มี leakage ───────────────
-    #
-    # แนวคิด: ถ้า pipeline ของเราสะอาด (ไม่มี leakage)
-    # การ shuffle target แบบ random → โมเดลไม่ควรเรียนรู้อะไรได้ → AUC ≈ 0.5
-    #
-    # ถ้า AUC ยังสูงหลัง shuffle → โมเดลกำลังเรียนรู้จาก "โครงสร้างข้อมูล"
-    # ไม่ใช่จาก target จริง → นั่นคือ leakage!
-    #
-    # เปรียบเทียบ: เหมือนสอบโดยเฉลยสุ่ม ถ้านักเรียนยังสอบได้ดี
-    # แสดงว่าเขา "โกง" ไม่ได้เรียนรู้จริงๆ
+    # ── Shuffle Sanity Test ───────────────────────────────────────────────────
+    # ใช้ pipeline เดิมทุกอย่าง แต่สลับ target แบบสุ่ม
+    # ถ้า AUC ยังสูง → มี leakage (โมเดลเรียนรู้จากโครงสร้าง ไม่ใช่ signal)
+    # ถ้า AUC ≈ 0.5  → pipeline สะอาด ✅
+
+    import time as _time3
 
     _lgb_params = {
         "objective": "binary", "metric": "auc", "learning_rate": 0.05,
         "num_leaves": 31, "verbosity": -1, "random_state": 42,
     }
 
-    # สร้าง target ที่ถูก shuffle แบบสมบูรณ์ — ตัดความสัมพันธ์กับ feature ทั้งหมด
-    rng         = np.random.default_rng(seed=0)
-    y_shuffled  = rng.permutation(y)   # สลับลำดับ target แบบสุ่ม
-    shuffle_oof = np.zeros(len(y))
+    _rng       = np.random.default_rng(seed=0)
+    _y_shuffle = _rng.permutation(y)   # สลับ target สุ่ม — ตัดความสัมพันธ์ทั้งหมด
+    _shuf_oof  = np.zeros(len(y))
 
     for _fold, (_tr_idx, _val_idx) in enumerate(skf.split(idx, y)):
-        # ใช้ pipeline เดิมทุกอย่าง แต่เปลี่ยน y → y_shuffled
         _inner_idx, _es_idx = train_test_split(
             _tr_idx, test_size=0.1, random_state=_fold, stratify=y[_tr_idx]
         )
+        # feature selection ยังใช้ target จริง (safe_cols ผ่าน Gate 1 แล้ว)
+        # แต่ training ใช้ y_shuffled → โมเดลไม่ควรเรียนรู้อะไรได้
         _inner_df = df[list(map(int, _inner_idx))]
-        _feats = (
-            _inner_df
-            .select([pl.corr(c, "target").alias(c) for c in numeric_cols])
-            .unpivot(variable_name="feature", value_name="corr")
-            .with_columns(pl.col("corr").abs())
-            .sort("corr", descending=True)
-            .head(TOP_N)
-        )["feature"].to_list()
+        _feats    = select_features_leak_free(_inner_df, safe_cols, TOP_N)
 
-        _X_inner = df[list(map(int, _inner_idx))].select(_feats).to_numpy()
-        _X_es    = df[list(map(int, _es_idx))   ].select(_feats).to_numpy()
-        _X_val   = df[list(map(int, _val_idx))  ].select(_feats).to_numpy()
+        _X_inner, _ = get_fold_arrays(df, _inner_idx, _feats)
+        _X_es,    _ = get_fold_arrays(df, _es_idx,    _feats)
+        _X_val,   _ = get_fold_arrays(df, _val_idx,   _feats)
 
-        # Train ด้วย y_shuffled แทน y จริง
-        _dtrain = lgb.Dataset(_X_inner, label=y_shuffled[_inner_idx])
-        _des    = lgb.Dataset(_X_es,    label=y_shuffled[_es_idx], reference=_dtrain)
+        # train กับ y ที่ shuffle แล้ว
+        _dtrain = lgb.Dataset(_X_inner, label=_y_shuffle[_inner_idx])
+        _des    = lgb.Dataset(_X_es,    label=_y_shuffle[_es_idx], reference=_dtrain)
         _model  = lgb.train(
             _lgb_params, _dtrain, num_boost_round=1000, valid_sets=[_des],
             callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(False)],
         )
-        shuffle_oof[_val_idx] = _model.predict(_X_val)
+        _shuf_oof[_val_idx] = _model.predict(_X_val)
 
-    # วัด AUC กับ y_shuffled (ไม่ใช่ y จริง) เพราะ model train กับ y_shuffled
-    shuffle_auc = roc_auc_score(y_shuffled, shuffle_oof)
-    # ถ้า |shuffle_auc - 0.5| < 0.02 = ผ่าน (ไม่มี leakage)
+    shuffle_auc = roc_auc_score(_y_shuffle, _shuf_oof)
     leakage_ok  = abs(shuffle_auc - 0.5) < 0.02
 
     mo.md(f"""
-    ## Step 4: Shuffle Sanity Test
-    Train the exact same pipeline with the **target randomly shuffled**.
+    ## Shuffle Sanity Test — พิสูจน์ว่าไม่มี leakage
 
-    | | AUC |
-    |-|-----|
-    | Real pipeline | **{lgb_oof_auc:.5f}** |
+    | Pipeline | AUC |
+    |----------|-----|
+    | Real target | **{lgb_oof_auc:.5f}** |
     | Shuffled target | **{shuffle_auc:.5f}** |
-    | Expected (no leakage) | ~0.500 |
+    | Expected | ~0.500 |
 
-    {"✅ **PASSED** — Shuffled AUC ≈ 0.5. Pipeline is leak-free." if leakage_ok else f"🔴 **FAILED** — Shuffled AUC = {shuffle_auc:.4f} (too far from 0.5). Leakage exists!"}
-
-    > ถ้า Shuffled AUC ยังสูง → โมเดลเรียนรู้จาก row order / index pattern ไม่ใช่ feature จริง
+    {"✅ **PASSED** — AUC ≈ 0.5 หลัง shuffle → pipeline สะอาด ไม่มี leakage" if leakage_ok else f"🔴 **FAILED** — AUC = {shuffle_auc:.4f} ยังสูงอยู่ → มี leakage!"}
     """)
     return leakage_ok, shuffle_auc
 
@@ -527,22 +572,23 @@ def _(
 @app.cell
 def _(
     N_FOLDS,
+    leakage_ok,
     lgb_fold_aucs,
     lgb_fold_feats,
     lgb_oof_auc,
+    lgb_time,
     mo,
     np,
     plt,
+    shuffle_auc,
     xgb_fold_aucs,
     xgb_oof_auc,
+    xgb_time,
 ):
-    def _plot_results():
+    def _plot_final():
         from collections import Counter
         fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
-        # ── กราฟซ้าย: AUC แต่ละ fold ─────────────────────────────────────────
-        # ถ้า AUC ต่างกันมากระหว่าง fold → โมเดลไม่ stable (อาจ overfit บาง fold)
-        # ถ้า AUC ใกล้เคียงกัน → โมเดล generalise ได้ดี
         x_pos = np.arange(N_FOLDS)
         w = 0.35
         axes[0].bar(x_pos - w/2, lgb_fold_aucs, w,
@@ -556,82 +602,54 @@ def _(
         axes[0].set_title("AUC per Fold", fontweight="bold")
         axes[0].legend()
 
-        # ── กราฟขวา: Feature Stability ────────────────────────────────────────
-        # นับว่าแต่ละ feature ถูกเลือกกี่ fold (จาก 5 fold ทั้งหมด)
-        # สีเขียว = เลือกครบทุก fold → signal แท้จริง ไม่ใช่ noise
-        # สีส้ม   = เลือก 3-4 fold → ค่อนข้าง stable
-        # สีแดง   = เลือก 1-2 fold → อาจเป็น noise หรือ unstable feature
         _counter = Counter(f for fold in lgb_fold_feats for f in fold)
-        _top = sorted(_counter.items(), key=lambda x: x[1], reverse=True)[:25]
+        _top     = sorted(_counter.items(), key=lambda x: x[1], reverse=True)[:25]
         _feats, _cnts = zip(*_top)
         _colors = ["#2ca02c" if c == N_FOLDS else "#ff7f0e" if c >= 3 else "#d62728"
                    for c in _cnts]
         axes[1].barh(list(_feats)[::-1], list(_cnts)[::-1], color=list(_colors)[::-1])
         axes[1].axvline(N_FOLDS, color="green", linestyle="--", alpha=0.7,
-                        label=f"All {N_FOLDS} folds (most stable)")
+                        label=f"All {N_FOLDS} folds = stable signal")
         axes[1].set_xlabel("# Folds Selected In")
-        axes[1].set_title("Feature Stability Across Folds\n(green = selected every fold = genuine signal)",
+        axes[1].set_title("Feature Stability\n(green = เลือกครบทุก fold = signal จริง)",
                           fontweight="bold")
         axes[1].legend()
 
-        plt.suptitle("Baseline Results — Leak-Free Pipeline", fontsize=13, fontweight="bold")
+        plt.suptitle("Leak-Free Baseline Results", fontsize=13, fontweight="bold")
         plt.tight_layout()
         return fig
 
-    fig_results = _plot_results()
-    mo.md("## Results")
-    return (fig_results,)
-
-
-@app.cell
-def _(fig_results):
-    fig_results
-    return
-
-
-@app.cell
-def _(
-    leakage_ok,
-    lgb_fold_aucs,
-    lgb_oof_auc,
-    lgb_time,
-    mo,
-    np,
-    shuffle_auc,
-    xgb_fold_aucs,
-    xgb_oof_auc,
-    xgb_time,
-):
+    fig_final = _plot_final()
     _winner = "LightGBM" if lgb_oof_auc >= xgb_oof_auc else "XGBoost"
 
     mo.md(f"""
-    ---
-    ## Final Baseline Summary
+    ## สรุปผล Baseline
 
     | Model | OOF AUC | Std | Time |
     |-------|---------|-----|------|
     | **LightGBM** | **{lgb_oof_auc:.5f}** | ±{np.std(lgb_fold_aucs):.5f} | {lgb_time:.1f}s |
     | **XGBoost**  | **{xgb_oof_auc:.5f}** | ±{np.std(xgb_fold_aucs):.5f} | {xgb_time:.1f}s |
-    | Shuffle test | {shuffle_auc:.5f} (expected ~0.500) | — | — |
+    | Shuffle test | {shuffle_auc:.5f} | expected ~0.500 | |
 
-    **Winner: {_winner}**
-    **Leakage status: {"✅ CLEAN" if leakage_ok else "🔴 LEAKAGE DETECTED"}**
+    **Winner: {_winner}** | **Leakage: {"✅ NONE" if leakage_ok else "🔴 DETECTED"}**
 
-    ---
-    ## Leakage Checklist
+    ## Leakage Guard Functions ที่ใช้
 
-    - [x] Red flag check (corr > 0.9) — passed
-    - [x] Feature selection inside inner train only
-    - [x] Early stopping on inner holdout — OOF never touched during training
-    - [x] No global imputation statistics
-    - [x] Shuffle sanity test — AUC collapses to ~0.5 ✅
-    - [ ] Time-based split — use for production model
-
-    ## Next Steps
-    - **Time-based split**: แบ่ง train/val ตามลำดับ customer statement date
-    - **All 1,262 features**: ให้ LightGBM เลือก feature เอง (จะ AUC สูงขึ้น)
-    - **Feature engineering**: `_last - _mean` (trend), D_ × B_ (interaction)
+    | ฟังก์ชัน | ป้องกันอะไร |
+    |----------|------------|
+    | `drop_red_flags()` | block feature ที่ corr > 0.9 ออกจาก model ถาวร |
+    | `select_features_leak_free()` | เลือก feature จาก inner train เท่านั้น |
+    | `get_fold_arrays()` | แปลงเฉพาะ rows+cols ที่อนุญาต ไม่มีทาง val รั่วเข้า |
+    | `train_lgb_fold()` | รับแค่ inner train + es holdout — ไม่รู้จัก OOF เลย |
+    | `train_xgb_fold()` | เหมือนกัน |
+    | `evaluate_oof()` | เรียกหลัง train เสร็จเท่านั้น — OOF ไม่เคยเข้า training |
     """)
+    return (fig_final,)
+
+
+@app.cell
+def _(fig_final):
+    fig_final
     return
 
 
