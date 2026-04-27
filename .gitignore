@@ -23,7 +23,7 @@ __pycache__/
 .venv/
 
 # ไม่เอาโมเดลที่ train แล้ว (ไฟล์ขนาดใหญ่)
-model/
+
 
 # ไม่เอา notebook checkpoints และ assets รูปภาพขนาดใหญ่
 notebooks/**/.ipynb_checkpoints/
