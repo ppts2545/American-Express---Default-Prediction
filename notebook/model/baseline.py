@@ -356,6 +356,50 @@ def _():
 
 
 @app.cell
+def _(Path, mo, pl, safe_cols):
+    # ── Gate 1.5: Feature Risk Filter ────────────────────────────────────────
+    # โหลดผล leakage_detection.py — block features ที่ risk_score ≥ 3
+    # ถ้าไม่มีไฟล์ → fallback ใช้ safe_cols จาก Gate 1 เหมือนเดิม
+    _ROOT = Path(__file__).resolve().parent
+    while not (_ROOT / "pixi.toml").exists():
+        _ROOT = _ROOT.parent
+
+    _risk_path = _ROOT / "data/processed/feature_risk_scores.parquet"
+    if _risk_path.exists():
+        _risk_df        = pl.read_parquet(_risk_path)
+        _blocked        = set(_risk_df.filter(pl.col("verdict") == "BLOCK")["feature"].to_list())
+        _watched        = set(_risk_df.filter(pl.col("verdict") == "WATCH")["feature"].to_list())
+        safe_cols_final = [c for c in safe_cols if c not in _blocked]
+        _n_blocked      = sum(c in _blocked for c in safe_cols)
+        _n_watched      = sum(c in _watched for c in safe_cols_final)
+        _status = (
+            f"| Safe cols (Gate 1) | {len(safe_cols)} |\n"
+            f"    | 🚨 Blocked (risk ≥ 3) | **{_n_blocked}** |\n"
+            f"    | ⚠️ Watch (ยังอยู่ใน pool) | **{_n_watched}** |\n"
+            f"    | ✅ safe_cols_final → เข้า CV | **{len(safe_cols_final)}** |"
+        )
+        _header = "✅ `feature_risk_scores.parquet` โหลดแล้ว"
+    else:
+        safe_cols_final = safe_cols
+        _status = f"| safe_cols_final (= safe_cols) | **{len(safe_cols_final)}** |"
+        _header = "⚠️ ยังไม่พบ `feature_risk_scores.parquet` — รัน `leakage_detection.py` ก่อน\n\n    ใช้ `safe_cols` จาก Gate 1 แทน"
+
+    mo.md(f"""
+    ## Gate 1.5: Feature Risk Filter
+
+    {_header}
+
+    | | จำนวน |
+    |-|-------|
+    {_status}
+
+    > **หมายเหตุ:** BLOCK features ถูกกรองออกชั่วคราว — วัดผล model ก่อน
+    > แล้วค่อยตรวจ False Positive ทีละตัวในขั้นต่อไป
+    """)
+    return (safe_cols_final,)
+
+
+@app.cell
 def _(
     N_FOLDS,
     StratifiedKFold,
@@ -365,7 +409,7 @@ def _(
     mo,
     np,
     roc_auc_score,
-    safe_cols,
+    safe_cols_final,
     select_features_leak_free,
     train_lgb_fold,
     train_test_split,
@@ -399,9 +443,9 @@ def _(
         )
 
         # Gate 2: เลือก feature จาก inner train เท่านั้น (ผ่านฟังก์ชัน)
-        # safe_cols มาจาก Gate 1 → ไม่มี red flag อยู่ใน pool แล้ว
+        # safe_cols_final มาจาก Gate 1 + Gate 1.5 → ผ่าน 5 เทคนิค leakage detection แล้ว
         _inner_df = df[list(map(int, _inner_idx))]
-        _feats    = select_features_leak_free(_inner_df, safe_cols, TOP_N)
+        _feats    = select_features_leak_free(_inner_df, safe_cols_final, TOP_N)
         lgb_fold_feats.append(_feats)
 
         # Gate 3: แปลงเฉพาะ rows+cols ที่อนุญาต (ผ่านฟังก์ชัน)
@@ -445,7 +489,7 @@ def _(
     mo,
     np,
     roc_auc_score,
-    safe_cols,
+    safe_cols_final,
     select_features_leak_free,
     skf,
     train_test_split,
@@ -471,7 +515,7 @@ def _(
         )
 
         _inner_df = df[list(map(int, _inner_idx))]
-        _feats    = select_features_leak_free(_inner_df, safe_cols, TOP_N)
+        _feats    = select_features_leak_free(_inner_df, safe_cols_final, TOP_N)
 
         _X_inner, _y_inner = get_fold_arrays(df, _inner_idx, _feats)
         _X_es,    _y_es    = get_fold_arrays(df, _es_idx,    _feats)
@@ -508,7 +552,7 @@ def _(
     mo,
     np,
     roc_auc_score,
-    safe_cols,
+    safe_cols_final,
     select_features_leak_free,
     skf,
     train_test_split,
@@ -534,10 +578,10 @@ def _(
         _inner_idx, _es_idx = train_test_split(
             _tr_idx, test_size=0.1, random_state=_fold, stratify=y[_tr_idx]
         )
-        # feature selection ยังใช้ target จริง (safe_cols ผ่าน Gate 1 แล้ว)
+        # feature selection ยังใช้ target จริง (safe_cols_final ผ่าน Gate 1 + 1.5 แล้ว)
         # แต่ training ใช้ y_shuffled → โมเดลไม่ควรเรียนรู้อะไรได้
         _inner_df = df[list(map(int, _inner_idx))]
-        _feats    = select_features_leak_free(_inner_df, safe_cols, TOP_N)
+        _feats    = select_features_leak_free(_inner_df, safe_cols_final, TOP_N)
 
         _X_inner, _ = get_fold_arrays(df, _inner_idx, _feats)
         _X_es,    _ = get_fold_arrays(df, _es_idx,    _feats)
