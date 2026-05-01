@@ -1,0 +1,49 @@
+# Leakage Detection Thresholds
+# แก้ที่นี่ที่เดียว — ทุก technique ในทุก notebook อ่านจากไฟล์นี้
+# ไม่ต้องค้นหา hardcode ทั่ว notebook
+
+# ─── T1: Null Pattern ────────────────────────────────────────────────────────
+[null_pattern]
+flagged_diff    = 0.10    # |null rate diff| สูงกว่านี้ → 🔴 flagged
+suspicious_diff = 0.05    # |null rate diff| สูงกว่านี้ → 🟠 suspicious
+
+# ─── T2: Class Separation ────────────────────────────────────────────────────
+[class_separation]
+flagged_d   = 3.0    # Cohen's d สูงกว่านี้ → 🔴 flagged
+watchlist_d = 1.5    # Cohen's d สูงกว่านี้ → 🟠 watchlist
+
+# ─── T3: Mutual Information ──────────────────────────────────────────────────
+[mutual_information]
+flagged    = 0.10    # MI สูงกว่านี้ → 🔴 flagged (non-linear relationship แรงมาก)
+suspicious = 0.03    # MI สูงกว่านี้ → 🟠 suspicious
+
+# ─── T4: Variance Ratio ──────────────────────────────────────────────────────
+[variance_ratio]
+flagged    = 5.0    # max(std₁/std₀, std₀/std₁) สูงกว่านี้ → 🔴 flagged
+suspicious = 3.0    # max(std₁/std₀, std₀/std₁) สูงกว่านี้ → 🟠 suspicious
+
+# ─── T5: PSI ─────────────────────────────────────────────────────────────────
+[psi]
+unstable = 0.25    # PSI สูงกว่านี้ → 🔴 unstable
+monitor  = 0.10    # PSI สูงกว่านี้ → 🟠 monitor
+buckets  = 10      # จำนวน bucket สำหรับคำนวณ PSI
+
+# ─── T6: Time Stability ──────────────────────────────────────────────────────
+[time_stability]
+unstable_gap_cv = 0.3    # gap_cv สูงกว่านี้ → 🔴 unstable
+
+# ─── T7: Single-Feature AUC ──────────────────────────────────────────────────
+[single_feat_auc]
+flagged    = 0.75    # single-feature AUC สูงกว่านี้ → 🔴 flagged
+suspicious = 0.65    # single-feature AUC สูงกว่านี้ → 🟠 suspicious
+watch      = 0.55    # single-feature AUC สูงกว่านี้ → 🟡 watch
+screen_at  = 0.60    # raw AUC สูงกว่านี้ → ส่งต่อ LGB pass
+
+# ─── T8/T9: Adversarial ──────────────────────────────────────────────────────
+[adversarial]
+suspicious_auc = 0.6    # AUC สูงกว่านี้ → suspicious (train/train หรือ train/test)
+
+# ─── Risk Score ──────────────────────────────────────────────────────────────
+[risk_score]
+block_threshold = 3    # risk_score >= นี้ → verdict = BLOCK
+watch_threshold = 2    # risk_score >= นี้ (หรืออยู่ใน watchlist) → verdict = WATCH

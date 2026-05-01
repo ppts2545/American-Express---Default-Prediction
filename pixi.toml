@@ -5,6 +5,19 @@ platforms = ["linux-64"]
 version = "0.1.0"
 
 [tasks]
+# ── Interactive notebooks (เปิด UI ใน browser) ────────────────────────────────
+nb-overview = "marimo run notebook/data_overview/raw_data_overview.py"
+nb-eda      = "marimo run notebook/eda/eda_feature_groups.py"
+nb-leakage  = "marimo run notebook/eda/leakage_detection.py"
+nb-risk     = "marimo run notebook/eda/risk_feature_analysis.py"
+nb-train    = "marimo run notebook/model/baseline.py"
+
+# ── Pipeline steps (headless — ไม่มี UI ใช้ใน terminal ได้เลย) ───────────────
+leakage  = "python scripts/leakage_detect.py"
+train    = "python scripts/train_baseline.py"
+
+# ── Full pipeline (leakage ก่อน → train ต่อ) ──────────────────────────────────
+pipeline = { cmd = "python scripts/leakage_detect.py && python scripts/train_baseline.py" }
 
 [dependencies]
 python = ">=3.14.4,<3.15"
