@@ -5,25 +5,141 @@ platforms = ["linux-64"]
 version = "0.1.0"
 
 [tasks]
-# ── Interactive notebooks (เปิด UI ใน browser) ────────────────────────────────
+
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║                        คำสั่ง pixi ทั้งหมด                                  ║
+# ║                                                                              ║
+# ║  วิธีรัน:  pixi run <ชื่อ command>                                           ║
+# ║  ตัวอย่าง: pixi run nb-train                                                 ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  STEP 0 — ดูข้อมูล Raw (ก่อนทำอะไรทั้งนั้น)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# เป้าหมาย : ดูโครงสร้าง raw data ก่อน preprocess — shape, dtypes, sample rows
+# เมื่อไหร่ : ครั้งแรกที่เริ่ม project หรือเมื่ออยากดูว่า raw data หน้าตาเป็นยังไง
+# output   : แค่แสดงผลใน browser ไม่มีไฟล์ output
 nb-overview = "marimo run notebook/data_overview/raw_data_overview.py"
+
+# เป้าหมาย : คู่มืออธิบายความหมายของทุก column (2,326 columns) ภาษาไทย
+#            ค้นหาได้ filter ได้ ดู null% / mean / std ของแต่ละ column
+# เมื่อไหร่ : เมื่ออยากรู้ว่า column ชื่อนี้หมายความว่าอะไร หรือจะ EDA เอง
+# output   : แค่แสดงผลใน browser ไม่มีไฟล์ output
+nb-columns  = "marimo run notebook/data_overview/column_guide.py"
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  STEP 1 — EDA (สำรวจข้อมูล — ทำหลัง preprocess เสร็จ)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# เป้าหมาย : EDA ภาพรวม — distribution ของแต่ละกลุ่ม feature (P/D/B/S/R)
+#            null rate, outliers, correlation matrix รายกลุ่ม
+# เมื่อไหร่ : หลัง nb-preprocess เสร็จ อยากสำรวจข้อมูลก่อน model
+# output   : แค่แสดงผลใน browser
 nb-eda      = "marimo run notebook/eda/eda_feature_groups.py"
-nb-leakage  = "marimo run notebook/eda/leakage_detection.py"
-nb-risk     = "marimo run notebook/eda/risk_feature_analysis.py"
+
+# เป้าหมาย : ตรวจ leakage 9 เทคนิค และแสดงผลแบบ interactive
+#            → ผลิต data/processed/feature_risk_scores.parquet (ใช้โดย nb-train)
+# เมื่อไหร่ : หลังเพิ่ม features ใหม่ทุกครั้ง (หลัง nb-feature-eng)
+#            ถ้าไม่รัน → Gate 1.5 ใน nb-train จะไม่มีข้อมูล leakage ของ features ใหม่
+# output   : data/processed/feature_risk_scores.parquet ← สำคัญมาก
+nb-gate     = "marimo run notebook/eda/feature_gate.py"
+
+# เป้าหมาย : วิเคราะห์ว่า feature ไหนมี predictive signal แรงแค่ไหน
+#            Cohen's d, AUC, distribution comparison (default vs non-default)
+# เมื่อไหร่ : เมื่ออยากเข้าใจว่า feature ไหน "ดี" ก่อนตัดสินใจ engineer เพิ่ม
+# output   : แค่แสดงผลใน browser (ไม่มีผลต่อ model)
+nb-signal   = "marimo run notebook/eda/feature_signal.py"
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  STEP 2 — Feature Engineering (เพิ่ม features ใหม่)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# เป้าหมาย : เพิ่ม 4 กลุ่ม features ให้ถึงระดับ Top Kaggle:
+#              ratio   (~530) — last/mean, last/max, min/max
+#              lag     (~354) — lag2, lag3 (ย้อน 2-3 เดือน)
+#              slope   (~177) — อัตราเปลี่ยนแปลงต่อเดือน
+#              count     (3)  — n_months, n_delinquent_months, delinquent_rate
+#            → overwrite train_features.parquet และ test_features.parquet
+#            → auto-register features ใหม่ใน feature_registry.json
+# เมื่อไหร่ : รันครั้งเดียวหลัง 01_preprocess.py (idempotent — รันซ้ำปลอดภัย)
+#            ถ้าเพิ่ม feature ใหม่ → แก้ notebook แล้วรันใหม่
+# output   : data/processed/train_features.parquet (2,326 features)
+#            data/processed/test_features.parquet  (2,326 features)
+#            feature_registry.json (auto-updated)
+# เวลา     : ~10-15 นาที (streaming raw CSV 5.5M rows)
+nb-feature-eng = "marimo run 02_feature_engineering.py"
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  STEP 3 — Train Model
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# เป้าหมาย : Train LightGBM + XGBoost ด้วย 5-Fold Leak-Free CV
+#            Gate 1   → ลบ features ที่ corr > 0.9 กับ target
+#            Gate 1.5 → block features ที่ leakage risk score ≥ 3
+#            Gate 2   → เลือก top 500 features ต่อ fold (จาก inner train เท่านั้น)
+#            Shuffle test → พิสูจน์ว่า pipeline ไม่มี leakage
+# เมื่อไหร่ : หลัง nb-gate รันแล้ว (ถ้าไม่มี feature_risk_scores.parquet → Gate 1.5 ถูกข้าม)
+# output   : แสดง OOF AUC, fold AUC, feature stability plot ใน browser
 nb-train    = "marimo run notebook/model/baseline.py"
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  STEP 4 — Insights (อ่านผลและ storytelling)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# เป้าหมาย : เล่าเรื่อง 6 chapters ว่า feature ไหนขับเคลื่อน credit default
+#            feature landscape, model favourites, defaulter portrait, group contribution
+# เมื่อไหร่ : หลัง train เสร็จ อยากนำเสนอหรือเขียน report
+# output   : แค่แสดงผลใน browser
 nb-insights = "marimo run notebook/insights/feature_story.py"
 
-# ── Pipeline steps (headless — ไม่มี UI ใช้ใน terminal ได้เลย) ───────────────
+# เป้าหมาย : visualize เปรียบเทียบ default vs non-default
+#            violin plots, aggregation type analysis, null pattern, correlation heatmap
+# เมื่อไหร่ : เมื่ออยากดู distribution ของ 2 กลุ่มแบบ side-by-side
+# output   : แค่แสดงผลใน browser
+nb-compare  = "marimo run notebook/insights/class_comparison.py"
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  TOOLS — เครื่องมือ (รันใน terminal ไม่มี UI)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# เป้าหมาย : ตรวจสุขภาพ pipeline ทั้งหมดใน 6 sections:
+#            1) ไฟล์ครบไหม  2) row count ถูกไหม  3) feature count ครบไหม
+#            4) data quality  5) leakage gate coverage  6) registry sync
+# เมื่อไหร่ : รันก่อน train ทุกครั้งถ้าไม่แน่ใจ หรือหลังเพิ่ม features ใหม่
+# output   : ✅ / ⚠️ / ❌ รายการ — exit code 0 (ok) หรือ 1 (มีปัญหา)
+audit    = "python scripts/audit_pipeline.py"
+
+# เป้าหมาย : แสดงสรุป feature_registry.json — กี่ features, แยก phase, active/deprecated
+# เมื่อไหร่ : เมื่ออยากเช็คว่า features ที่ register ไว้มีอะไรบ้าง
+# output   : print summary ใน terminal
+registry = "python scripts/feature_registry.py"
+
+# เป้าหมาย : รัน leakage detection 9 เทคนิคแบบ headless (ไม่มี UI)
+#            → ผลิต feature_risk_scores.parquet เหมือน nb-gate แต่ใช้ใน terminal ได้
+# เมื่อไหร่ : ใช้แทน nb-gate เมื่อรันใน server หรือ CI ที่ไม่มี browser
+# output   : data/processed/feature_risk_scores.parquet
 leakage  = "python scripts/leakage_detect.py"
+
+# เป้าหมาย : train model แบบ headless (ไม่มี UI) — ผลลัพธ์ print ใน terminal
+# เมื่อไหร่ : ใช้แทน nb-train เมื่อรันใน server หรือ CI
+# output   : print OOF AUC ใน terminal
 train    = "python scripts/train_baseline.py"
 
-# ── Full pipeline (leakage ก่อน → train ต่อ) ──────────────────────────────────
-pipeline = { cmd = "python scripts/leakage_detect.py && python scripts/train_baseline.py" }
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  FULL PIPELINE — รันทุกอย่างต่อเนื่องแบบ headless
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# เป้าหมาย : audit → leakage → train ต่อเนื่องในคำสั่งเดียว
+#            ถ้า audit fail → หยุดทันที ไม่รัน leakage และ train
+# เมื่อไหร่ : เมื่อต้องการ retrain ทั้งหมดแบบ automated ใน terminal
+# หมายเหตุ : nb-feature-eng ต้องรันก่อนด้วยมือ (ต้องการ browser สำหรับ progress)
+pipeline = { cmd = "python scripts/audit_pipeline.py && python scripts/leakage_detect.py && python scripts/train_baseline.py" }
 
 [dependencies]
 python = ">=3.14.4,<3.15"
 polars = ">=1.40.0,<2"
-marimo = ">=0.23.3,<0.24"
+marimo = ">=0.23.4,<0.24"
 numpy = ">=2.4.3,<3"
 pandas = ">=3.0.2,<4"
 matplotlib = ">=3.10.9,<4"

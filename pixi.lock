@@ -152,7 +152,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/lightgbm-4.6.0-cpu_py_ha6cb263_7.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/loro-1.10.3-py314h5059d10_1.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/lz4-c-1.10.0-h5888daf_1.conda
-      - conda: https://conda.anaconda.org/conda-forge/linux-64/marimo-0.23.3-py314h9e666f3_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-64/marimo-0.23.4-py314h9e666f3_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/markdown-3.10.2-pyhcf101f3_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/matplotlib-3.10.9-py314hdafbbf9_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/matplotlib-base-3.10.9-py314h1194b4b_0.conda
@@ -2049,9 +2049,9 @@ packages:
   license_family: BSD
   size: 167055
   timestamp: 1733741040117
-- conda: https://conda.anaconda.org/conda-forge/linux-64/marimo-0.23.3-py314h9e666f3_0.conda
-  sha256: ee0f60a2f42a9b551c14e7a83f460a12ebfd79b7a1a47bb0b3b1a6c937f84e00
-  md5: 6316081e5243ad2a815d6623ee7023dc
+- conda: https://conda.anaconda.org/conda-forge/linux-64/marimo-0.23.4-py314h9e666f3_0.conda
+  sha256: fea3745962bfd6ea0e9ec018b6d83de4869f766aa5a53ae78854b079f924df7f
+  md5: 1dc0e6fa0f4905200dcceced309fddb3
   depends:
   - python
   - click >=8.0,<9
@@ -2074,8 +2074,9 @@ packages:
   - pyzmq >=27.1.0
   - python_abi 3.14.* *_cp314
   license: Apache-2.0
-  size: 34302106
-  timestamp: 1777117110646
+  license_family: APACHE
+  size: 34306046
+  timestamp: 1777413958099
 - conda: https://conda.anaconda.org/conda-forge/noarch/markdown-3.10.2-pyhcf101f3_0.conda
   sha256: 20e0892592a3e7c683e3d66df704a9425d731486a97c34fc56af4da1106b2b6b
   md5: ba0a9221ce1063f31692c07370d062f3

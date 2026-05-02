@@ -1,6 +1,6 @@
 import marimo
 
-__generated_with = "0.23.3"
+__generated_with = "0.23.4"
 app = marimo.App(width="full")
 
 
@@ -350,7 +350,7 @@ def _(fig_gate):
 
 @app.cell
 def _():
-    TOP_N   = 30   # จำนวน feature ที่เลือกต่อ fold
+    TOP_N   = 500  # จำนวน feature ที่เลือกต่อ fold (ก่อน: 30 → ตอนนี้มี 2,195 safe features)
     N_FOLDS = 5    # จำนวน fold ใน CV
     return N_FOLDS, TOP_N
 
@@ -424,7 +424,7 @@ def _(
 
     _lgb_params = {
         "objective": "binary", "metric": "auc",
-        "learning_rate": 0.05, "num_leaves": 31, "max_depth": 6,
+        "learning_rate": 0.05, "num_leaves": 127, "max_depth": -1,
         "min_child_samples": 100, "feature_fraction": 0.8,
         "bagging_fraction": 0.8, "bagging_freq": 1,
         "verbosity": -1, "random_state": 42,
@@ -437,16 +437,19 @@ def _(
     _t0 = _time.time()
     for _fold, (_tr_idx, _val_idx) in enumerate(_skf.split(_idx, _y)):
 
+        mo.output.append(mo.md(f"⏳ **Fold {_fold+1}/{N_FOLDS}** — selecting features..."))
+
         # แบ่ง training → inner train + early-stop holdout
         _inner_idx, _es_idx = train_test_split(
             _tr_idx, test_size=0.1, random_state=_fold, stratify=_y[_tr_idx]
         )
 
         # Gate 2: เลือก feature จาก inner train เท่านั้น (ผ่านฟังก์ชัน)
-        # safe_cols_final มาจาก Gate 1 + Gate 1.5 → ผ่าน 5 เทคนิค leakage detection แล้ว
         _inner_df = df[list(map(int, _inner_idx))]
         _feats    = select_features_leak_free(_inner_df, safe_cols_final, TOP_N)
         lgb_fold_feats.append(_feats)
+
+        mo.output.append(mo.md(f"⏳ **Fold {_fold+1}/{N_FOLDS}** — training LightGBM ({len(_feats)} features)..."))
 
         # Gate 3: แปลงเฉพาะ rows+cols ที่อนุญาต (ผ่านฟังก์ชัน)
         _X_inner, _y_inner = get_fold_arrays(df, _inner_idx, _feats)
@@ -460,6 +463,9 @@ def _(
         _preds, _auc       = evaluate_oof(_model, _X_val, _y_val, "lgb")
         lgb_oof[_val_idx]  = _preds
         lgb_fold_aucs.append(_auc)
+
+        _elapsed = _time.time() - _t0
+        mo.output.append(mo.md(f"✅ **Fold {_fold+1}/{N_FOLDS}** — AUC = `{_auc:.5f}` ({_elapsed:.1f}s elapsed)"))
 
     lgb_time    = _time.time() - _t0
     lgb_oof_auc = roc_auc_score(_y, lgb_oof)
